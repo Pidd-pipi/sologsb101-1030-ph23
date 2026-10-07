@@ -7,9 +7,20 @@ import type { Tuning } from '$lib/types/tuning';
 import type { Voicing } from '$lib/types/voicing';
 import type { Environment } from '$lib/types/environment';
 import type { Reminder } from '$lib/types/reminder';
-import { DB_NAME, DB_SCHEMA_VERSION, db, listEnvironments, listTunings, listVoicings } from './db';
+import type { PitchConclusion } from '$lib/types/pitchLedger';
+import {
+  DB_NAME,
+  DB_SCHEMA_VERSION,
+  db,
+  listEnvironments,
+  listTunings,
+  listVoicings,
+  type ConclusionRow,
+  type TuningRow
+} from './db';
 import { nowIso } from './uuid';
 import { zoneDistribution } from './cents';
+import { buildPianoLedger } from '$lib/stores/pitchLedgerStore';
 
 /** 单台钢琴档案 */
 export interface PianoArchive {
@@ -21,6 +32,24 @@ export interface PianoArchive {
   voicings: Voicing[];
   environments: Environment[];
   reminder: Reminder | null;
+  /** 结论历史（已确认的旧结论全部留痕） */
+  conclusions: PitchConclusion[];
+  /**
+   * 漂移与建议结论：环境改动后即便趋势已重算，未复核前导出仍采用最新一条已确认结论；
+   * 没有任何结论时才退化为当前测算。
+   */
+  pitchVerdict: {
+    status: '已确认' | '待复核' | '无结论';
+    source: '已确认结论' | '当前测算（尚未确认）';
+    driftCentsPerMonth: number;
+    level: string;
+    adviceLevel: string;
+    adviceText: string;
+    /** 当前实时测算（环境改动后可能与已确认结论不一致） */
+    liveDriftCentsPerMonth: number;
+    liveLevel: string;
+    liveAdviceText: string;
+  };
   summary: {
     tuningCount: number;
     avgDeviationCents: number;
@@ -47,17 +76,30 @@ function stripRevision<T extends WithRevision>(row: T): T {
 export async function buildPianoArchive(pianoId: string): Promise<PianoArchive> {
   const piano = await db.pianos.get(pianoId);
   if (!piano) throw new Error('钢琴档案不存在');
-  const [allTunings, allVoicings, allEnvironments, reminder] = await Promise.all([
+  const [allTunings, allVoicings, allEnvironments, reminder, allConclusions] = await Promise.all([
     listTunings(),
     listVoicings(),
     listEnvironments(),
-    db.reminders.where('pianoId').equals(pianoId).first()
+    db.reminders.where('pianoId').equals(pianoId).first(),
+    db.conclusions.where('pianoId').equals(pianoId).toArray()
   ]);
-  const tunings = allTunings.filter((item) => item.pianoId === pianoId);
+  // 导出与提醒口径一致：待确认（多标签页冲突）的调律暂不入账
+  const tunings = allTunings.filter((item) => item.pianoId === pianoId && !item.pendingReview);
   const voicings = allVoicings.filter((item) => item.pianoId === pianoId);
   const environments = allEnvironments.filter((item) => item.pianoId === pianoId);
+  const conclusions = allConclusions
+    .slice()
+    .sort((a, b) => b.confirmedAt.localeCompare(a.confirmedAt)) as ConclusionRow[];
   const latest = tunings[0];
   const worstZone = latest ? zoneDistribution(latest.zones).worst : '—';
+
+  // 未复核前导出照旧用最新一条已确认结论
+  const ledger = buildPianoLedger(
+    pianoId,
+    tunings as TuningRow[],
+    environments,
+    conclusions
+  );
 
   return {
     name: DB_NAME,
@@ -68,6 +110,18 @@ export async function buildPianoArchive(pianoId: string): Promise<PianoArchive> 
     voicings: voicings.map(stripRevision),
     environments: environments.map(stripRevision),
     reminder: reminder ? stripRevision(reminder) : null,
+    conclusions: conclusions.map(stripRevision),
+    pitchVerdict: {
+      status: ledger.status,
+      source: ledger.effectiveSource,
+      driftCentsPerMonth: ledger.effectiveDriftCentsPerMonth,
+      level: ledger.effectiveLevel,
+      adviceLevel: ledger.effectiveAdviceLevel,
+      adviceText: ledger.effectiveAdviceText,
+      liveDriftCentsPerMonth: ledger.live.driftCentsPerMonth,
+      liveLevel: ledger.live.level,
+      liveAdviceText: ledger.live.adviceText
+    },
     summary: {
       tuningCount: tunings.length,
       avgDeviationCents: latest ? latest.avgDeviationCents : 0,

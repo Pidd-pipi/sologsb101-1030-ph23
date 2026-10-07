@@ -37,8 +37,9 @@ export const EMPTY_SUMMARY: CentsSummary = {
 
 /** 纯函数版派生：按钢琴 id 汇总（页面逐行统计时直接调用） */
 export function summarizeCents(tunings: TuningRow[], pianoId: string): CentsSummary {
+  // 多标签页并发保存产生的待确认记录在裁决前不计入正式音分小结
   const own = tunings
-    .filter((item) => item.pianoId === pianoId)
+    .filter((item) => item.pianoId === pianoId && !item.pendingReview)
     .sort((a, b) => b.date.localeCompare(a.date));
   if (own.length === 0) return { ...EMPTY_SUMMARY };
   const latest = own[0];

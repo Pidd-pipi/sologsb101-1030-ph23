@@ -6,9 +6,11 @@
   import StatBadge from '$lib/components/common/StatBadge.svelte';
   import EmptyPanel from '$lib/components/common/EmptyPanel.svelte';
   import CentsTag from '$lib/components/common/CentsTag.svelte';
+  import TuningConflict from '$lib/components/common/TuningConflict.svelte';
   import { useIdbTable } from '$lib/hooks/useIdbTable';
   import { summarizeCents } from '$lib/hooks/useCentsDeviation';
-  import { db, type PianoRow, type TuningRow } from '$lib/utils/db';
+  import { useTuningConflicts } from '$lib/hooks/useTuningConflicts';
+  import { db, type EnvironmentRow, type PianoRow, type TuningRow } from '$lib/utils/db';
   import {
     createEmptyTuning,
     REPITCH_AVG_THRESHOLD,
@@ -20,23 +22,30 @@
   import {
     createTuning,
     deleteTuning,
+    discardTuningConflict,
     editTuning,
     resetTuningFilters,
+    resolveTuningConflict,
     setTuningFilters,
     TUNING_FILTER_KEYS,
     tuningFilters
   } from '$lib/stores/tuningStore';
   import { bandColor, barHeight, centsFromStandardPitch, formatCents, needsRepitch } from '$lib/utils/cents';
+  import { nearestEnvironment } from '$lib/utils/ledger';
+  import { daysBetween } from '$lib/utils/uuid';
   import type { FilterModel, FilterSelectConfig } from '$lib/types/filter';
   import { queryToFilters, toQueryString } from '$lib/utils/query';
 
   const pianos = useIdbTable<PianoRow>(db.pianos, (a, b) => a.brand.localeCompare(b.brand, 'zh-Hans-CN'));
   const tunings = useIdbTable<TuningRow>(db.tunings, (a, b) => b.date.localeCompare(a.date));
+  const environments = useIdbTable<EnvironmentRow>(db.environments, (a, b) => b.date.localeCompare(a.date));
+  const conflicts = useTuningConflicts(tunings);
 
   let dialogOpen = $state(false);
   let editingId = $state<string | null>(null);
   let form = $state<Omit<Tuning, 'id'>>(createEmptyTuning());
   let formError = $state<string | null>(null);
+  let saveNotice = $state<string | null>(null);
 
   const selects = $derived<FilterSelectConfig[]>([
     {
@@ -54,6 +63,11 @@
     const piano = $pianos.find((item) => item.id === pianoId);
     return piano ? `${piano.brand} ${piano.model}` : '钢琴已删除';
   }
+
+  /** 表单当前钢琴 + 日期对应的同期最近环境记录（录入时预挂，保存时落快照） */
+  const formEnvPreview = $derived(
+    form.pianoId && form.date ? nearestEnvironment($environments, form.pianoId, form.date) : null
+  );
 
   const filtered = $derived(
     $tunings.filter((tuning) => {
@@ -105,6 +119,7 @@
     form = createEmptyTuning();
     if ($pianos.length > 0) form.pianoId = $pianos[0].id;
     formError = null;
+    saveNotice = null;
     dialogOpen = true;
   }
 
@@ -118,7 +133,11 @@
       maxDeviationCents: tuning.maxDeviationCents,
       zones: { ...tuning.zones },
       technician: tuning.technician,
-      pitchRaised: tuning.pitchRaised
+      pitchRaised: tuning.pitchRaised,
+      env: tuning.env ? { ...tuning.env } : null,
+      pendingReview: tuning.pendingReview,
+      reviewGroupId: tuning.reviewGroupId,
+      reviewReason: tuning.reviewReason
     };
     formError = null;
     dialogOpen = true;
@@ -138,18 +157,44 @@
       return;
     }
     recalc();
-    const payload = { ...form, zones: { ...form.zones } };
+    // 温湿度统一由 store 按同期最近环境回填；冲突标记只能通过下方「保留/丢弃」按钮裁决，编辑不改动
+    const payload = {
+      ...form,
+      zones: { ...form.zones },
+      env: null,
+      ...(editingId
+        ? {
+            pendingReview: form.pendingReview,
+            reviewGroupId: form.reviewGroupId,
+            reviewReason: form.reviewReason
+          }
+        : { pendingReview: false, reviewGroupId: '', reviewReason: '' })
+    };
     if (editingId) {
       await editTuning(editingId, payload);
+      saveNotice = null;
     } else {
-      await createTuning(payload);
+      const result = await createTuning(payload);
+      saveNotice = result.pendingReview
+        ? '检测到同一天已有另一条调律（可能来自另一个标签页），两条都已保留，请在下方冲突区确认。'
+        : null;
     }
-    dialogOpen = false;
+    if (!saveNotice) dialogOpen = false;
   }
 
   async function remove(tuning: TuningRow): Promise<void> {
     if (!window.confirm(`删除 ${tuning.date} 的调律记录？`)) return;
     await deleteTuning(tuning.id);
+  }
+
+  async function keepConflict(groupId: string, keptId: string): Promise<void> {
+    if (!window.confirm('保留这一条并删除同组其余调律？')) return;
+    await resolveTuningConflict(groupId, keptId);
+  }
+
+  async function discardConflict(id: string): Promise<void> {
+    if (!window.confirm('丢弃这条待确认调律？')) return;
+    await discardTuningConflict(id);
   }
 
   function applyFilters(next: FilterModel): void {
@@ -210,6 +255,14 @@
       oncreate={openCreate}
     />
   {:else}
+    {#if $conflicts.length > 0}
+      <div class="flex flex-col gap-3">
+        {#each $conflicts as group (group.groupId)}
+          <TuningConflict {group} {pianoLabel} onResolve={keepConflict} onDiscard={discardConflict} />
+        {/each}
+      </div>
+    {/if}
+
     <div class="card">
       <div class="card-title mb-3">
         <span>音区偏差条形图（{pianoLabel(filtered[0].pianoId)} · {filtered[0].date}）</span>
@@ -241,6 +294,7 @@
             <th class="py-2">平均偏差</th>
             <th class="py-2">最大偏差</th>
             <th class="py-2">低 / 中 / 高音区</th>
+            <th class="py-2">当时温湿度</th>
             <th class="py-2">调律师</th>
             <th class="py-2">复调</th>
             <th class="py-2">操作</th>
@@ -248,8 +302,13 @@
         </thead>
         <tbody>
           {#each filtered as tuning (tuning.id)}
-            <tr class="border-b border-stone-100">
-              <td class="py-2">{pianoLabel(tuning.pianoId)}</td>
+            <tr class="border-b border-stone-100 {tuning.pendingReview ? 'bg-amber-50/60' : ''}">
+              <td class="py-2">
+                {pianoLabel(tuning.pianoId)}
+                {#if tuning.pendingReview}
+                  <div class="mt-0.5"><span class="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">待确认</span></div>
+                {/if}
+              </td>
               <td class="py-2">{tuning.date}</td>
               <td class="py-2 tabular-nums">
                 {tuning.basePitchHz} Hz
@@ -259,6 +318,18 @@
               <td class="py-2"><CentsTag cents={tuning.maxDeviationCents} size="sm" /></td>
               <td class="py-2 tabular-nums text-xs text-stone-500">
                 {tuning.zones.bass} / {tuning.zones.mid} / {tuning.zones.treble}
+              </td>
+              <td class="py-2 text-xs">
+                {#if tuning.env}
+                  <div class="tabular-nums text-stone-600">{tuning.env.tempC}℃ / {tuning.env.humidityPct}%</div>
+                  {#if tuning.env.source === '迁移回填'}
+                    <span class="rounded-full bg-sky-100 px-1.5 py-0.5 text-[10px] text-sky-700" title="按同期最近一条回填（{tuning.env.envDate}，相差 {tuning.env.dayGap} 天）">迁移回填</span>
+                  {:else}
+                    <span class="rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] text-emerald-700">实测</span>
+                  {/if}
+                {:else}
+                  <span class="muted">无关联</span>
+                {/if}
               </td>
               <td class="py-2">{tuning.technician}</td>
               <td class="py-2">
@@ -342,6 +413,22 @@
           <div class="mt-1 text-stone-400">该琴历史调律 {dialogSummary.tuningCount} 次，上次 {dialogSummary.lastTuningDate}</div>
         {/if}
       </div>
+
+      <div class="mt-2 rounded-lg px-3 py-2 text-xs {formEnvPreview ? 'bg-sky-50 text-sky-700' : 'bg-stone-50 text-stone-500'}">
+        {#if formEnvPreview}
+          {@const sameDay = formEnvPreview.date === form.date}
+          {@const dayGap = Math.abs(daysBetween(form.date, formEnvPreview.date))}
+          琴房温湿度将按同期最近一条{sameDay ? '（同日实测）' : '回填'}：
+          {formEnvPreview.date} · {formEnvPreview.tempC}℃ / {formEnvPreview.humidityPct}%
+          {#if !sameDay}<span class="ml-1">（与调律日期相差 {dayGap} 天，来源标记为「迁移回填」）</span>{/if}
+        {:else}
+          该琴还没有环境记录，保存后温湿度关联为空；后续补录环境会按同期最近一条自动回填。
+        {/if}
+      </div>
+
+      {#if saveNotice}
+        <div class="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700">{saveNotice}</div>
+      {/if}
 
       <div class="mt-5 flex justify-end gap-2">
         <button type="button" class="btn" onclick={() => (dialogOpen = false)}>取消</button>

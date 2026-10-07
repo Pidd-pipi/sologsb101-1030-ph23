@@ -215,6 +215,7 @@
             <button type="button" class="btn" onclick={() => push(`/tunings?pianoIds=${piano.id}`)}>去调律</button>
             <button type="button" class="btn" onclick={() => push(`/voicings?pianoIds=${piano.id}`)}>维修履历</button>
             <button type="button" class="btn" onclick={() => push(`/environments?pianoIds=${piano.id}`)}>环境</button>
+            <button type="button" class="btn" onclick={() => push(`/ledger?pianoId=${piano.id}`)}>音准账</button>
             <button type="button" class="btn" onclick={() => openEdit(piano)}>编辑</button>
             <button type="button" class="btn-danger" onclick={() => remove(piano)}>删除</button>
           </div>

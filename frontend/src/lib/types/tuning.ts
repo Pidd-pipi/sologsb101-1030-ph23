@@ -8,6 +8,25 @@ export interface TuningZones {
   treble: number;
 }
 
+/** 温湿度来源：录入时直接关联 / 迁移回填（同期最近一条）/ 无可用环境记录 */
+export type EnvLinkSource = '实测' | '迁移回填' | '无';
+
+/** 调律记录上挂的琴房温湿度快照（音准账的一笔） */
+export interface TuningEnvLink {
+  /** 引用的环境记录 id（回填时为同期最近一条；无关联时为空） */
+  environmentId: string;
+  /** 温度 ℃ */
+  tempC: number;
+  /** 相对湿度 % */
+  humidityPct: number;
+  /** 环境记录日期 */
+  envDate: string;
+  /** 温湿度来源标记 */
+  source: EnvLinkSource;
+  /** 与调律日期相差的天数（回填时用于交代“同期最近”） */
+  dayGap: number;
+}
+
 /** 调律记录 */
 export interface Tuning {
   id: string;
@@ -27,6 +46,14 @@ export interface Tuning {
   technician: string;
   /** 是否需二次复调 */
   pitchRaised: boolean;
+  /** 当次调律时的琴房温湿度（旧数据迁移时按同期最近一条回填） */
+  env: TuningEnvLink | null;
+  /** 多标签页并发保存时：本条是否处于待确认状态（不覆盖对方，双方都留） */
+  pendingReview: boolean;
+  /** 并发分组 id：同一组互斥保存的记录共享该 id，等待人工确认 */
+  reviewGroupId: string;
+  /** 待确认原因说明 */
+  reviewReason: string;
 }
 
 /** 标准基准音高 */
@@ -51,6 +78,10 @@ export function createEmptyTuning(): Omit<Tuning, 'id'> {
     maxDeviationCents: 0,
     zones: { bass: 0, mid: 0, treble: 0 },
     technician: '',
-    pitchRaised: false
+    pitchRaised: false,
+    env: null,
+    pendingReview: false,
+    reviewGroupId: '',
+    reviewReason: ''
   };
 }

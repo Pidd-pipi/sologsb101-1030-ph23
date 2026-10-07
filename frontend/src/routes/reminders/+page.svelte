@@ -14,6 +14,8 @@
     exportSnapshot,
     importSnapshot,
     resetDatabase,
+    type ConclusionRow,
+    type EnvironmentRow,
     type PianoRow,
     type ReminderRow,
     type TuningRow
@@ -31,6 +33,7 @@
     setReminderFilters,
     sortByUrgency
   } from '$lib/stores/reminderStore';
+  import { usePitchLedgers } from '$lib/stores/pitchLedgerStore';
   import { buildPianoArchive, downloadJson, parseArchive, serializeArchive } from '$lib/utils/export';
   import type { FilterModel } from '$lib/types/filter';
   import { queryToFilters, toQueryString } from '$lib/utils/query';
@@ -38,6 +41,9 @@
   const pianos = useIdbTable<PianoRow>(db.pianos, (a, b) => a.brand.localeCompare(b.brand, 'zh-Hans-CN'));
   const reminders = useIdbTable<ReminderRow>(db.reminders, (a, b) => a.nextDueDate.localeCompare(b.nextDueDate));
   const tunings = useIdbTable<TuningRow>(db.tunings, (a, b) => b.date.localeCompare(a.date));
+  const environments = useIdbTable<EnvironmentRow>(db.environments, (a, b) => b.date.localeCompare(a.date));
+  const conclusions = useIdbTable<ConclusionRow>(db.conclusions, (a, b) => b.confirmedAt.localeCompare(a.confirmedAt));
+  const ledgers = usePitchLedgers(tunings, environments, conclusions);
 
   let dialogOpen = $state(false);
   let editingId = $state<string | null>(null);
@@ -68,6 +74,17 @@
     return $tunings.find((item) => item.pianoId === pianoId)?.date ?? '';
   }
 
+  /** 音准账：提醒口径取「最新一条已确认结论」，环境改动待复核时照旧用旧结论 */
+  function ledgerOf(pianoId: string) {
+    return $ledgers.get(pianoId) ?? null;
+  }
+
+  /** 需要复调 / 换弦的琴（按仍在使用的结论） */
+  function needsAction(pianoId: string): boolean {
+    const ledger = ledgerOf(pianoId);
+    return !!ledger && ledger.effectiveAdviceLevel !== 'none';
+  }
+
   const filtered = $derived.by(() =>
     sortByUrgency(
       $reminders.filter((reminder) => {
@@ -87,10 +104,14 @@
   const totals = $derived.by(() => {
     const overdue = $reminders.filter((item) => item.state === '超期').length;
     const soon = $reminders.filter((item) => item.state === '临近').length;
+    const stale = $reminders.filter((item) => ledgerOf(item.pianoId)?.status === '待复核').length;
+    const action = $reminders.filter((item) => needsAction(item.pianoId)).length;
     return {
       total: $reminders.length,
       overdue,
       soon,
+      stale,
+      action,
       normal: $reminders.filter((item) => item.state === '正常').length,
       coverage: $pianos.length > 0 ? Math.round(($reminders.length / $pianos.length) * 100) : 0
     };
@@ -256,6 +277,8 @@
     <StatBadge label="超期" value={totals.overdue} suffix="台" tone="rose" icon="‼" />
     <StatBadge label="临近" value={totals.soon} suffix="台" tone="amber" icon="!" />
     <StatBadge label="正常" value={totals.normal} suffix="台" tone="green" icon="✓" />
+    <StatBadge label="结论待复核" value={totals.stale} suffix="台" tone="amber" icon="⚠" />
+    <StatBadge label="建议复调/换弦" value={totals.action} suffix="台" tone="rose" icon="🎼" />
     <StatBadge label="琴档覆盖率" value={totals.coverage} percent={totals.coverage} showPercent tone="brass" icon="%" />
   </div>
 
@@ -305,12 +328,14 @@
             <th class="py-2">下次建议</th>
             <th class="py-2">剩余天数</th>
             <th class="py-2">状态</th>
+            <th class="py-2">音准建议</th>
             <th class="py-2">操作</th>
           </tr>
         </thead>
         <tbody>
           {#each filtered as reminder (reminder.id)}
             {@const days = daysToDue(reminder.nextDueDate)}
+            {@const ledger = ledgerOf(reminder.pianoId)}
             <tr class="border-b border-stone-100 {reminder.state === '超期' ? 'bg-rose-50/70' : ''}">
               <td class="py-2">{pianoLabel(reminder.pianoId)}</td>
               <td class="py-2">{pianoOf(reminder.pianoId)?.venue ?? '—'}</td>
@@ -326,6 +351,25 @@
                       ? 'bg-amber-100 text-amber-700'
                       : 'bg-emerald-100 text-emerald-700'}">{reminder.state}</span
                 >
+              </td>
+              <td class="py-2">
+                {#if ledger}
+                  <span
+                    class="rounded-full px-2 py-0.5 text-xs {ledger.effectiveAdviceLevel === 'restring'
+                      ? 'bg-rose-100 text-rose-700'
+                      : ledger.effectiveAdviceLevel === 'retune'
+                        ? 'bg-amber-100 text-amber-700'
+                        : 'bg-stone-100 text-stone-600'}"
+                    title="{ledger.effectiveSource} · {ledger.effectiveDriftCentsPerMonth} 音分/30 天"
+                  >
+                    {ledger.effectiveAdviceText}
+                  </span>
+                  {#if ledger.status === '待复核'}
+                    <div class="muted mt-0.5 text-amber-600">待复核：新测算 {ledger.live.adviceText}</div>
+                  {/if}
+                {:else}
+                  <span class="muted">无音准账</span>
+                {/if}
               </td>
               <td class="py-2">
                 <button type="button" class="btn mr-2" onclick={() => openEdit(reminder)}>编辑</button>
@@ -368,6 +412,7 @@
         <div class="rounded-lg bg-stone-50 px-3 py-2">钢琴 / 调律：{counts.pianos ?? 0} / {counts.tunings ?? 0}</div>
         <div class="rounded-lg bg-stone-50 px-3 py-2">维修 / 环境：{counts.voicings ?? 0} / {counts.environments ?? 0}</div>
         <div class="rounded-lg bg-stone-50 px-3 py-2">提醒：{counts.reminders ?? 0}</div>
+        <div class="rounded-lg bg-stone-50 px-3 py-2">音准结论：{counts.conclusions ?? 0}（待复核 {totals.stale}）</div>
         <div class="rounded-lg bg-stone-50 px-3 py-2">超期琴：{totals.overdue} 台</div>
       </div>
       <div class="mt-3 flex flex-wrap gap-2">
