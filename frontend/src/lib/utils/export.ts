@@ -7,9 +7,20 @@ import type { Tuning } from '$lib/types/tuning';
 import type { Voicing } from '$lib/types/voicing';
 import type { Environment } from '$lib/types/environment';
 import type { Reminder } from '$lib/types/reminder';
-import { DB_NAME, DB_SCHEMA_VERSION, db, listEnvironments, listTunings, listVoicings } from './db';
+import type { DriftConclusion } from '$lib/types/conclusion';
+import {
+  DB_NAME,
+  DB_SCHEMA_VERSION,
+  db,
+  getEffectiveConclusion,
+  listConclusions,
+  listEnvironments,
+  listTunings,
+  listVoicings
+} from './db';
 import { nowIso } from './uuid';
 import { zoneDistribution } from './cents';
+import { analyzeDrift, suggestCycleMonths, type DriftAnalysis } from './drift';
 
 /** 单台钢琴档案 */
 export interface PianoArchive {
@@ -21,6 +32,22 @@ export interface PianoArchive {
   voicings: Voicing[];
   environments: Environment[];
   reminder: Reminder | null;
+  /** 结论历史（旧结论永久留存） */
+  conclusions: DriftConclusion[];
+  /** 导出时生效的结论：没复核前沿用最近一条已确认旧结论 */
+  effectiveConclusion: DriftConclusion | null;
+  /** 生效结论是否已落后于实时漂移（待复核） */
+  conclusionStale: boolean;
+  /** 实时漂移（环境改动后立即重算的值，仅供对照） */
+  liveDrift: {
+    driftCentsPer30Days: number;
+    level: DriftAnalysis['level'];
+    worstZone: string;
+    trend: DriftAnalysis['trend'];
+    summary: string;
+    advice: string[];
+    suggestedCycleMonths: number | null;
+  } | null;
   summary: {
     tuningCount: number;
     avgDeviationCents: number;
@@ -47,17 +74,26 @@ function stripRevision<T extends WithRevision>(row: T): T {
 export async function buildPianoArchive(pianoId: string): Promise<PianoArchive> {
   const piano = await db.pianos.get(pianoId);
   if (!piano) throw new Error('钢琴档案不存在');
-  const [allTunings, allVoicings, allEnvironments, reminder] = await Promise.all([
+  const [allTunings, allVoicings, allEnvironments, allConclusions, reminder] = await Promise.all([
     listTunings(),
     listVoicings(),
     listEnvironments(),
+    listConclusions(),
     db.reminders.where('pianoId').equals(pianoId).first()
   ]);
   const tunings = allTunings.filter((item) => item.pianoId === pianoId);
   const voicings = allVoicings.filter((item) => item.pianoId === pianoId);
   const environments = allEnvironments.filter((item) => item.pianoId === pianoId);
+  const conclusions = allConclusions
+    .filter((item) => item.pianoId === pianoId)
+    .sort((a, b) => b.createdAt - a.createdAt);
   const latest = tunings[0];
   const worstZone = latest ? zoneDistribution(latest.zones).worst : '—';
+
+  // 没复核前沿用最近一条「已确认」旧结论；确认结论缺失才回退待复核
+  const effective = await getEffectiveConclusion(pianoId);
+  const live = analyzeDrift(pianoId, tunings, environments);
+  const conclusionStale = effective ? effective.envFingerprint !== live.envFingerprint : false;
 
   return {
     name: DB_NAME,
@@ -68,6 +104,30 @@ export async function buildPianoArchive(pianoId: string): Promise<PianoArchive> 
     voicings: voicings.map(stripRevision),
     environments: environments.map(stripRevision),
     reminder: reminder ? stripRevision(reminder) : null,
+    conclusions: conclusions.map((c) => {
+      const { revision: _r, updatedAt: _u, ...rest } = c;
+      return rest;
+    }),
+    effectiveConclusion: effective
+      ? (() => {
+          const { revision: _r, updatedAt: _u, ...rest } = effective;
+          return rest;
+        })()
+      : null,
+    conclusionStale,
+    liveDrift: live.sampleCount > 0
+      ? {
+          driftCentsPer30Days: live.driftCentsPer30Days,
+          level: live.level,
+          worstZone: live.worstZone,
+          trend: live.trend,
+          summary: live.summary,
+          advice: live.advice,
+          suggestedCycleMonths: live.insufficient
+            ? null
+            : suggestCycleMonths(live.level, reminder?.cycleMonths ?? 6)
+        }
+      : null,
     summary: {
       tuningCount: tunings.length,
       avgDeviationCents: latest ? latest.avgDeviationCents : 0,

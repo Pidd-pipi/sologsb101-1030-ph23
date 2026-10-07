@@ -6,6 +6,7 @@ import type { Component } from 'svelte';
 import { ROUTES } from '$lib/router';
 import PianosPage from '../../routes/pianos/+page.svelte';
 import TuningsPage from '../../routes/tunings/+page.svelte';
+import LedgerPage from '../../routes/ledger/+page.svelte';
 import VoicingsPage from '../../routes/voicings/+page.svelte';
 import EnvironmentsPage from '../../routes/environments/+page.svelte';
 import RemindersPage from '../../routes/reminders/+page.svelte';
@@ -15,6 +16,7 @@ export const routes: Record<string, Component> = {
   '/': PianosPage,
   [ROUTES.pianos]: PianosPage,
   [ROUTES.tunings]: TuningsPage,
+  [ROUTES.ledger]: LedgerPage,
   [ROUTES.voicings]: VoicingsPage,
   [ROUTES.environments]: EnvironmentsPage,
   [ROUTES.reminders]: RemindersPage,

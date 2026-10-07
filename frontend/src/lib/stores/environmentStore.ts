@@ -1,10 +1,15 @@
 /**
  * 琴房环境 store：维护温湿度记录的筛选条件与增删改动作。
+ * 任意一条环境的增 / 改 / 删都会重接调律温湿度并使漂移结论立即失效重算。
  */
 import { writable, type Writable } from 'svelte/store';
 import type { FilterModel } from '$lib/types/filter';
 import type { Environment } from '$lib/types/environment';
-import { putEnvironment, removeEnvironment, updateEnvironment as updateEnvironmentRow } from '$lib/utils/db';
+import {
+  removeEnvironment,
+  updateEnvironment as updateEnvironmentRow,
+  upsertEnvironmentAndRecompute
+} from '$lib/utils/db';
 import { buildRow } from '$lib/hooks/useIdbTable';
 
 /** 参与 URL 同步的筛选键（switch 为「仅看超标记录」开关） */
@@ -25,12 +30,14 @@ export function resetEnvironmentFilters(): void {
   environmentFilters.set({ keyword: '', pianoIds: [], switch: false });
 }
 
+/** 新增环境记录并重算受影响琴的音准账 */
 export async function createEnvironment(payload: Omit<Environment, 'id'>): Promise<string> {
   const row = buildRow(payload, 'environment');
-  await putEnvironment(row);
+  await upsertEnvironmentAndRecompute(row);
   return row.id;
 }
 
+/** 修改环境记录（含改挂钢琴），新旧两台琴的结论都会失效重算 */
 export async function editEnvironment(id: string, patch: Partial<Environment>): Promise<void> {
   await updateEnvironmentRow(id, patch);
 }

@@ -2,7 +2,7 @@
 
 面向钢琴调律师与琴行售后的本地化档案工具：按琴建档后逐次记录调律的基准音高与各音区音分偏差，登记整音、换弦与击弦机调整等维修事项，同时记录琴房温度湿度并跟踪调律周期与下次建议日期。
 
-核心动作：**建琴档案 → 录调律前后音分 → 记整音维修 → 录琴房环境 → 算周期并提醒下次调律 → 导出档案**。
+核心动作：**建琴档案 → 录调律前后音分 → 记整音维修 → 录琴房环境 → 算漂移并出复调/换弦建议 → 算周期并提醒下次调律 → 导出档案**。
 
 纯前端单页应用（Svelte 5 + TypeScript + Vite + Svelte SPA Router + Tailwind CSS + Dexie），**无后端、无数据库服务、无 API 服务**，全部数据保存在浏览器本地（IndexedDB），刷新或重启浏览器后仍然存在。
 
@@ -45,7 +45,7 @@ docker compose up -d --build      # 代码改动后重新构建
 | 构建工具 | Vite 6 | 开发服务器端口 22830 |
 | 状态管理 | Svelte store（`writable` / `derived`） | `pianoStore` / `tuningStore` / `voicingStore` / `environmentStore` / `reminderStore` |
 | 路由 | svelte-spa-router 5（hash 路由） | 路由表在 `src/lib/router/index.ts` |
-| 本地存储 | Dexie 4（IndexedDB 封装） | 库名 `gbpianotune-db`，含结构版本号与 upgrade 迁移 |
+| 本地存储 | Dexie 4（IndexedDB 封装） | 库名 `gbpianotune-db`，当前 `version(2)`，含 v1→v2 upgrade 迁移（回填温湿度、补基线结论） |
 | 容器化 | Docker 多阶段构建：`node:20-alpine` → `nginx:alpine` | 构建阶段执行类型检查与打包，运行阶段仅托管静态产物 |
 
 ---
@@ -68,10 +68,11 @@ npm run check      # 仅做类型检查
 | 路由 | 模块 | 消费模型 | 主要交互 |
 | --- | --- | --- | --- |
 | `/pianos` | 钢琴档案台账 | Piano、Tuning、Reminder | 新建/编辑/删除琴档（删除确认与级联）、按品牌/类型/场所筛选、卡片回显最近调律日期、平均音分偏差与下次建议日期、筛选同步 URL query |
-| `/tunings` | 调律记录 | Tuning、Piano | 录入基准音高与低/中/高音区音分偏差、自动计算平均与最大值、**音区偏差条形图**、超阈值自动标记需复调 |
+| `/tunings` | 调律记录 | Tuning、Piano、Environment | 录入基准音高与低/中/高音区音分偏差、自动计算平均与最大值、**音区偏差条形图**、保存时按同期最近一条自动关联温湿度（当天实测/跨日回填并标来源）、超阈值自动标记需复调；**双标签页并发保存同琴近日期调律时两条都保留为「待确认」，可采纳/忽略，互不覆盖** |
+| `/ledger` | 音准账（漂移与建议） | Tuning、Environment、Conclusion | 按时间顺序串联每次调律的音区偏差与当时温湿度，估算综合与各音区漂移速度（音分/30天）与快慢档位，给出复调/换弦/周期建议；展示待复核新结论、生效旧结论与结论历史 |
 | `/voicings` | 整音与维修 | Voicing、Piano | 登记毡槌/击弦机/换弦/踏板事项、按钢琴汇总维修履历、切换计划/已完成（完成回写钢琴状态） |
-| `/environments` | 琴房温湿度记录 | Environment、Piano | 按日期录入温湿度、**超出建议区间（18–26 ℃ / 40–60 %）自动判定并用 Tailwind 高亮超标行**、超标天数统计 |
-| `/reminders` | 调律周期提醒与导出 | Reminder 及全部模型 | 由周期与上次调律日期推算下次建议日期、**超期琴置顶**、按场所批量筛选、单琴档案与整库 JSON 导出导入 |
+| `/environments` | 琴房温湿度记录 | Environment、Tuning、Conclusion | 按日期录入温湿度、**超出建议区间（18–26 ℃ / 40–60 %）自动判定并用 Tailwind 高亮超标行**、超标天数统计；**任意环境增删改都会重接调律温湿度并使漂移结论立即失效重算** |
+| `/reminders` | 调律周期提醒与导出 | Reminder、Conclusion 及全部模型 | 由周期与上次调律日期推算下次建议日期、**超期琴置顶**、按场所批量筛选；显示各琴生效漂移结论并可一键套用建议周期；**没复核前沿用最近一条已确认旧结论**；单琴档案与整库 JSON 导出导入 |
 
 ---
 
@@ -92,22 +93,29 @@ sologsb101-1030/
     ├── public/favicon.svg
     └── src/
         ├── main.ts  App.svelte  app.css  vite-env.d.ts
-        ├── lib/types/              # piano.ts tuning.ts voicing.ts environment.ts reminder.ts filter.ts
-        ├── lib/stores/             # pianoStore tuningStore voicingStore environmentStore reminderStore
-        ├── lib/components/common/  # CentsTag.svelte FilterBar.svelte StatBadge.svelte EmptyPanel.svelte
-        ├── lib/hooks/              # useCentsDeviation.ts useIdbTable.ts
-        ├── lib/utils/              # cents.ts db.ts export.ts seed.ts uuid.ts query.ts
+        ├── lib/types/              # piano.ts tuning.ts voicing.ts environment.ts reminder.ts conclusion.ts filter.ts
+        ├── lib/stores/             # pianoStore tuningStore voicingStore environmentStore reminderStore ledgerStore
+        ├── lib/components/common/  # CentsTag DriftBadge PitchTimeline ConclusionCard FilterBar StatBadge EmptyPanel
+        ├── lib/hooks/              # useCentsDeviation.ts usePitchLedger.ts useIdbTable.ts
+        ├── lib/utils/              # cents.ts drift.ts db.ts export.ts seed.ts uuid.ts query.ts
         ├── lib/router/index.ts     # 路由表与导航配置
-        └── routes/                 # pianos/ tunings/ voicings/ environments/ reminders/ 各一个 +page.svelte
+        └── routes/                 # pianos/ tunings/ ledger/ voicings/ environments/ reminders/ 各一个 +page.svelte
 ```
 
 ---
 
-## 六、数据存储说明
+## 六、数据存储说明（音准账）
 
-- **IndexedDB 库名**：`gbpianotune-db`（Dexie 封装），结构版本号 `version(1)`，并带 `upgrade()` 迁移逻辑（为历史行补齐行修订号与时间戳）。
-- **分表存储**：`pianos` 钢琴、`tunings` 调律、`voicings` 整音维修、`environments` 琴房环境、`reminders` 周期提醒，共 5 张表；每行带 `revision` / `createdAt` / `updatedAt`。
-- **首屏自动播种**：`lib/utils/db.ts` 的 `initDatabase()` 在 `pianos` 表为空时调用 `seedDatabase()`，灌入互相引用的三层演示数据（钢琴 → 调律记录 → 维修 / 环境 → 提醒），其中包含 1 台超期琴与 2 条异常环境记录，保证 5 个页面首次打开都有内容；播种幂等，清空后重进会重新播种。
+- **IndexedDB 库名**：`gbpianotune-db`（Dexie 封装），当前数据结构 `version(2)`，带 v1→v2 的 `upgrade()` 迁移。
+- **分表存储（6 张）**：`pianos` 钢琴、`tunings` 调律、`voicings` 整音维修、`environments` 琴房环境、`reminders` 周期提醒、`conclusions` 漂移结论；每行带 `revision` / `createdAt` / `updatedAt`（结论的 `createdAt` / `reviewedAt` 是业务字段）。
+- **调律 × 温湿度关联**：`tunings.envRef` 保存当时温湿度快照与来源——`实测`（当天）/`回填`（同期最近一条，记录 `envDate` 与相差 `gapDays`）/`无`。
+- **漂移测速**：`lib/utils/drift.ts` 以「正常 / 已采纳」调律为准，按相邻调律间隔对偏差变化加权，输出综合与低/中/高音区的漂移速度（音分/30天）、快慢档位（稳定 ≤3、偏快 ≤8、过快 >8）与复调/换弦/周期建议；「待确认 / 已忽略」不参与测速。
+- **结论生命周期（复核制）**：
+  - 结论是某一时刻的**快照**而非实时值；实时趋势在音准账页即时重算展示。
+  - **环境记录一改动**（增/改/删，含改挂钢琴）→ 重接该琴调律温湿度、环境指纹变化 → 当前「待复核」结论置「已失效」，并生成一条新的「待复核」。
+  - **已确认过的旧结论永久留在历史**；在人工复核新结论之前，周期提醒与档案导出一律沿用最近一条「已确认」旧结论（`getEffectiveConclusion`）。
+- **双标签页并发保存**：同一台琴、日期相差 ≤3 天的两条「正常」调律几乎同时保存时，后保存的不覆盖先保存的：两条都保留、互标 `conflictOf` 并置「待确认」，在调律记录页人工「采纳本次 / 忽略」；采纳的转「已采纳」参与统计，另一条转「已忽略」。
+- **v1→v2 迁移回填**：旧调律没有温湿度关联时，按同期最近一条环境（31 天内）回填并标「回填」来源，无同期则标「无」；并为每台有调律的琴补一条「已确认」基线结论，使升级后无需先复核、提醒与导出照旧可用。
 - **音分换算**：`lib/utils/cents.ts` 提供 `cents = 1200 × log2(f / f0)` 与反算、与标准音 A4 = 440 Hz 的比对、偏差分档（±5 / ±10 / ±20 / ±20 以上）与配色映射。
 - **无后端**：没有 API 服务、没有数据库容器；容器本身无状态，不挂载任何卷。
-- **级联规则**：删除钢琴会级联删除其调律、维修、环境与提醒记录。
+- **级联规则**：删除钢琴会级联删除其调律、维修、环境、提醒与结论记录。

@@ -10,10 +10,11 @@
 export { installRouter, navigate, normalizePath, push, replace, resolveRoute, router } from './router.svelte';
 export type { InstallOptions, RouteMap, RouterState } from './router.svelte';
 
-/** 五个模块路径（与需求逐字一致） */
+/** 模块路径 */
 export const ROUTES = {
   pianos: '/pianos',
   tunings: '/tunings',
+  ledger: '/ledger',
   voicings: '/voicings',
   environments: '/environments',
   reminders: '/reminders'
@@ -33,6 +34,7 @@ export interface NavItem {
 export const NAV_ITEMS: NavItem[] = [
   { path: ROUTES.pianos, label: '钢琴档案', icon: '🎹', hint: '品牌 / 场所 / 状态' },
   { path: ROUTES.tunings, label: '调律记录', icon: '🎼', hint: '基准音高与音分偏差' },
+  { path: ROUTES.ledger, label: '音准账', icon: '📈', hint: '漂移快慢与复调建议' },
   { path: ROUTES.voicings, label: '整音与维修', icon: '🛠️', hint: '毡槌 / 击弦机 / 换弦' },
   { path: ROUTES.environments, label: '琴房环境', icon: '🌡️', hint: '温湿度与超标提示' },
   { path: ROUTES.reminders, label: '周期提醒', icon: '⏰', hint: '超期琴与档案导出' }

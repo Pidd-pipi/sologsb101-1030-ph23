@@ -14,6 +14,7 @@
     exportSnapshot,
     importSnapshot,
     resetDatabase,
+    type ConclusionRow,
     type PianoRow,
     type ReminderRow,
     type TuningRow
@@ -32,12 +33,43 @@
     sortByUrgency
   } from '$lib/stores/reminderStore';
   import { buildPianoArchive, downloadJson, parseArchive, serializeArchive } from '$lib/utils/export';
+  import { analyzeDrift } from '$lib/utils/drift';
   import type { FilterModel } from '$lib/types/filter';
   import { queryToFilters, toQueryString } from '$lib/utils/query';
 
   const pianos = useIdbTable<PianoRow>(db.pianos, (a, b) => a.brand.localeCompare(b.brand, 'zh-Hans-CN'));
   const reminders = useIdbTable<ReminderRow>(db.reminders, (a, b) => a.nextDueDate.localeCompare(b.nextDueDate));
   const tunings = useIdbTable<TuningRow>(db.tunings, (a, b) => b.date.localeCompare(a.date));
+  const environments = useIdbTable(db.environments, (a, b) => b.date.localeCompare(a.date));
+  const conclusions = useIdbTable<ConclusionRow>(db.conclusions, (a, b) => b.createdAt - a.createdAt);
+
+  /** 各琴生效结论（没复核前沿用最近一条已确认旧结论） */
+  const effectiveByPiano = $derived.by(() => {
+    const map = new Map<string, ConclusionRow>();
+    for (const c of $conclusions) {
+      if (!map.has(c.pianoId) && c.status === '已确认') map.set(c.pianoId, c);
+    }
+    for (const c of $conclusions) {
+      if (!map.has(c.pianoId) && c.status === '待复核') map.set(c.pianoId, c);
+    }
+    return map;
+  });
+
+  /** 实时漂移（用于标注生效结论是否已落后） */
+  const liveByPiano = $derived.by(() => {
+    const map = new Map<string, ReturnType<typeof analyzeDrift>>();
+    for (const piano of $pianos) {
+      map.set(
+        piano.id,
+        analyzeDrift(
+          piano.id,
+          $tunings.filter((t) => t.pianoId === piano.id),
+          $environments.filter((e) => e.pianoId === piano.id)
+        )
+      );
+    }
+    return map;
+  });
 
   let dialogOpen = $state(false);
   let editingId = $state<string | null>(null);
@@ -66,6 +98,22 @@
   /** 最近一次调律日期（用于校准周期） */
   function lastTuningOf(pianoId: string): string {
     return $tunings.find((item) => item.pianoId === pianoId)?.date ?? '';
+  }
+
+  /** 套用生效结论给出的建议周期（确认前用的是旧结论，保持稳定） */
+  async function applySuggestedCycle(reminder: ReminderRow): Promise<void> {
+    const conclusion = effectiveByPiano.get(reminder.pianoId);
+    const months = conclusion?.suggestedCycleMonths;
+    if (!months || months === reminder.cycleMonths) return;
+    const last = reminder.lastTuningDate || lastTuningOf(reminder.pianoId);
+    const nextDueDate = computeNextDue(last, months);
+    await editReminder(reminder.id, {
+      cycleMonths: months,
+      lastTuningDate: last,
+      nextDueDate,
+      state: computeState(nextDueDate)
+    });
+    await refreshCounts();
   }
 
   const filtered = $derived.by(() =>
@@ -300,6 +348,7 @@
           <tr>
             <th class="py-2">钢琴</th>
             <th class="py-2">场所</th>
+            <th class="py-2">漂移结论</th>
             <th class="py-2">周期</th>
             <th class="py-2">上次调律</th>
             <th class="py-2">下次建议</th>
@@ -311,10 +360,54 @@
         <tbody>
           {#each filtered as reminder (reminder.id)}
             {@const days = daysToDue(reminder.nextDueDate)}
+            {@const conclusion = effectiveByPiano.get(reminder.pianoId) ?? null}
+            {@const live = liveByPiano.get(reminder.pianoId) ?? null}
+            {@const stale = conclusion && live ? conclusion.envFingerprint !== live.envFingerprint : false}
             <tr class="border-b border-stone-100 {reminder.state === '超期' ? 'bg-rose-50/70' : ''}">
               <td class="py-2">{pianoLabel(reminder.pianoId)}</td>
               <td class="py-2">{pianoOf(reminder.pianoId)?.venue ?? '—'}</td>
-              <td class="py-2">{reminder.cycleMonths} 个月</td>
+              <td class="py-2">
+                {#if conclusion}
+                  <div class="flex items-center gap-1.5">
+                    <span
+                      class="rounded-full px-2 py-0.5 text-[11px] {conclusion.level === '稳定'
+                        ? 'bg-emerald-100 text-emerald-700'
+                        : conclusion.level === '偏快'
+                          ? 'bg-amber-100 text-amber-700'
+                          : 'bg-rose-100 text-rose-700'}"
+                    >
+                      {conclusion.level}
+                    </span>
+                    <span class="text-[11px] tabular-nums text-stone-500">
+                      {Math.abs(conclusion.driftCentsPer30Days)}/30天
+                    </span>
+                  </div>
+                  {#if stale}
+                    <button
+                      type="button"
+                      class="mt-1 text-[11px] text-amber-700 underline-offset-2 hover:underline"
+                      onclick={() => push(`/ledger?piano=${encodeURIComponent(reminder.pianoId)}`)}
+                    >
+                      环境已变·待复核
+                    </button>
+                  {/if}
+                {:else}
+                  <span class="muted">—</span>
+                {/if}
+              </td>
+              <td class="py-2">
+                {reminder.cycleMonths} 个月
+                {#if conclusion?.suggestedCycleMonths && conclusion.suggestedCycleMonths !== reminder.cycleMonths}
+                  <button
+                    type="button"
+                    class="ml-1 rounded bg-walnut/10 px-1.5 py-0.5 text-[10px] text-walnut hover:bg-walnut/20"
+                    title="套用生效结论的建议周期"
+                    onclick={() => applySuggestedCycle(reminder)}
+                  >
+                    建议 {conclusion.suggestedCycleMonths} 月
+                  </button>
+                {/if}
+              </td>
               <td class="py-2">{reminder.lastTuningDate || '—'}</td>
               <td class="py-2">{reminder.nextDueDate || '—'}</td>
               <td class="py-2 tabular-nums {days < 0 ? 'font-semibold text-rose-700' : ''}">{days} 天</td>
